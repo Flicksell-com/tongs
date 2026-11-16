@@ -20,6 +20,10 @@ go install github.com/Flicksell-com/tongs@latest
 
 Needs Go 1.25 or later. Runs on macOS and Linux, arm64 and x86-64.
 
+Or download the `tongs` built for your machine from the
+[latest release](https://github.com/Flicksell-com/tongs/releases/latest), make
+it executable and put it on your `PATH`.
+
 - On macOS, the Xcode Command Line Tools must be installed
   (`xcode-select --install`); lldb uses their `debugserver` to control
   processes.
@@ -214,6 +218,30 @@ From the Debugger menu:
 
 To use a debugger of your own, set `TONGS_ADAPTER` to the path of a `codelldb`
 adapter binary.
+
+## Updating
+
+Once a day, when it starts, tongs asks GitHub whether a newer release is out.
+If one is, a green **Update** button appears at the top right. The button,
+**Tongs: update to the newest release** in the Debugger menu, and
+`tongs update` in a shell all do the same thing: download the release's tongs
+for this machine, check it against the checksum GitHub publishes for it, and
+put it in place of the one installed. The tongs that is open keeps running;
+the next start is the new one.
+
+`tongs version` prints the version. A tongs built from a checkout rather than
+from a release is never offered an update: build it again instead.
+
+### Releasing
+
+Pushing a tag releases that version:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The `release` workflow builds tongs for each platform and attaches the four
+binaries to a GitHub release named after the tag.
 
 ## Notes
 

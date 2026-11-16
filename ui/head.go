@@ -28,7 +28,7 @@ var menus = []struct {
 	{"Watch", []string{"watch", "watch_word", "watch_clear"}},
 	{"View", []string{"files", "tab_next", "tab_prev", "tab_close", "-", "definition", "references", "hover", "-",
 		"side_vars", "side_threads", "side", "sizes", "themes"}},
-	{"Debugger", []string{"lldb_fresh", "lldb_versions"}},
+	{"Debugger", []string{"lldb_fresh", "lldb_versions", "-", "update"}},
 }
 
 // tall says whether the window can spare the head its full height: three
@@ -123,11 +123,31 @@ func (m *model) menuBar() (rows []string, starts []int) {
 	}
 	face := lipgloss.NewStyle().Background(fill)
 	search := face.Foreground(colText).Render("   ⌕ Search  ") + face.Foreground(colOverlay).Render("f1   ")
-	gap := m.width - width - lipgloss.Width(search) - 1
+	end := []string{zone.Mark("tool:menu", pill(search, fill, height)), " "}
+	// A newer release, when there is one, is a button beside it: in full
+	// where there is room, then in short, then not at all.
+	forms := []string{""}
+	if m.newer != "" {
+		forms = []string{"  ↑ Update to " + m.newer + "  ", "  ↑ " + m.newer + "  ", ""}
+	}
 	row := left
-	if gap >= 1 {
-		m.zones = append(m.zones, "tool:menu")
-		row = lipgloss.JoinHorizontal(lipgloss.Top, left, repeat(" ", gap), zone.Mark("tool:menu", pill(search, fill, height)), " ")
+	for _, form := range forms {
+		right, ids := end, []string{"tool:menu"}
+		if form != "" {
+			fill := colGreen
+			if m.hot == "tool:update" {
+				fill = mix(colGreen, colText, 0.3)
+			}
+			label := lipgloss.NewStyle().Background(fill).Foreground(colCrust).Bold(true).Render(form)
+			right = append([]string{zone.Mark("tool:update", pill(label, fill, height)), " "}, end...)
+			ids = append(ids, "tool:update")
+		}
+		joined := lipgloss.JoinHorizontal(lipgloss.Top, right...)
+		if gap := m.width - width - lipgloss.Width(joined); gap >= 1 {
+			m.zones = append(m.zones, ids...)
+			row = lipgloss.JoinHorizontal(lipgloss.Top, left, repeat(" ", gap), joined)
+			break
+		}
 	}
 	for _, line := range splitLines(row) {
 		rows = append(rows, paint(fit(line, m.width), colCrust))
@@ -238,7 +258,7 @@ func (m *model) toolBar(rows int) []string {
 	}
 	if got := int(m.progress.Load()) - 1; got >= 0 {
 		done := min(got/10, 10)
-		info += styAccent.Render("   debugger "+repeat("▰", done)) + styDim.Render(repeat("▱", 10-done)) + stySub.Render(fmt.Sprintf(" %d%%", got))
+		info += styAccent.Render("   download "+repeat("▰", done)) + styDim.Render(repeat("▱", 10-done)) + stySub.Render(fmt.Sprintf(" %d%%", got))
 	}
 	if keys := m.count + m.prefix; keys != "" {
 		info += styHit.Render("   " + keys)

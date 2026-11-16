@@ -26,6 +26,7 @@ import (
 	"github.com/Flicksell-com/tongs/nav"
 	"github.com/Flicksell-com/tongs/session"
 	"github.com/Flicksell-com/tongs/store"
+	"github.com/Flicksell-com/tongs/update"
 )
 
 const (
@@ -72,6 +73,7 @@ var actions = []struct{ name, key, action string }{
 	{"Colours: choose a theme", "", "themes"},
 	{"Debugger: download it again", "", "lldb_fresh"},
 	{"Debugger: choose a version", "", "lldb_versions"},
+	{"Tongs: update to the newest release", "", "update"},
 	{"Quit", "ctrl+q", "quit"},
 }
 
@@ -95,6 +97,7 @@ var asks = map[string]struct{ mark, hint string }{
 
 type (
 	changedMsg    struct{}
+	newerMsg      string // the release newer than this tongs, "" for none
 	frameMsg      struct{}
 	candidatesMsg struct {
 		text  string
@@ -199,9 +202,10 @@ type model struct {
 	frame      int    // counts up while something on screen is moving
 	framing    bool   // a frameMsg is on its way
 	flashAt    time.Time
-	// How far a download of the debugger has got, in percent plus one; 0
-	// when none is going on.
+	// How far a download has got, in percent plus one; 0 when none is going
+	// on.
 	progress    atomic.Int32
+	newer       string       // the release newer than this tongs, "" for none
 	stateKey    string       // the target the screen's state belongs to
 	stateFor    *store.Entry // the same, for saving it back
 	expanded    map[string]bool
@@ -276,10 +280,13 @@ func Run(root, adapter string, entries []store.Entry, first *store.Entry) error 
 func (m *model) Init() tea.Cmd {
 	if m.first != nil {
 		m.s.Load(*m.first) // Opened, not run: Run does that.
-		return textinput.Blink
+	} else {
+		m.openTargets()
 	}
-	m.openTargets()
-	return textinput.Blink
+	return tea.Batch(textinput.Blink, func() tea.Msg {
+		tag, _ := update.Newer(false) // Not reaching GitHub is nothing to say.
+		return newerMsg(tag)
+	})
 }
 
 // ---- update ----
@@ -337,6 +344,11 @@ func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case changedMsg:
 		return m, m.refresh()
+	case newerMsg:
+		if m.newer = string(msg); m.newer != "" {
+			m.s.Note("note", "tongs "+m.newer+" is out; this is "+update.Version()+". The button at the top right updates it, as does `tongs update`.")
+		}
+		return m, nil
 	case candidatesMsg:
 		m.offer(msg)
 		return m, nil
@@ -620,20 +632,7 @@ func (m *model) debugger(version string, fresh bool) tea.Cmd {
 	}
 	return func() tea.Msg {
 		defer m.progress.Store(0)
-		adapter, err := lldb.Use(version, fresh, func(line string) {
-			// "  40%" moves the bar in the status line; the rest is said.
-			if percent, err := strconv.Atoi(strings.TrimSuffix(strings.TrimSpace(line), "%")); err == nil {
-				m.progress.Store(int32(percent) + 1)
-				if m.s.OnChange != nil {
-					m.s.OnChange() // The bar is drawn from here on.
-				}
-				return
-			}
-			if strings.HasPrefix(line, "downloading") {
-				m.progress.Store(1)
-			}
-			m.s.Note("note", line)
-		})
+		adapter, err := lldb.Use(version, fresh, m.downloading)
 		if err != nil {
 			m.s.Note("error", err.Error())
 			return nil
@@ -641,6 +640,48 @@ func (m *model) debugger(version string, fresh bool) tea.Cmd {
 		m.s.SetAdapter(adapter)
 		m.s.Note("note", "Using CodeLLDB "+version+". ctrl+r starts the program with it.")
 		return nil
+	}
+}
+
+// downloading takes what a download says of itself: "  40%" moves the bar in
+// the status line; the rest goes to the log.
+func (m *model) downloading(line string) {
+	if percent, err := strconv.Atoi(strings.TrimSuffix(strings.TrimSpace(line), "%")); err == nil {
+		m.progress.Store(int32(percent) + 1)
+		if m.s.OnChange != nil {
+			m.s.OnChange() // The bar is drawn from here on.
+		}
+		return
+	}
+	if strings.HasPrefix(line, "downloading") {
+		m.progress.Store(1)
+	}
+	m.s.Note("note", line)
+}
+
+// upgrade puts the newest release of tongs in place of this one, if there is
+// a newer one. This one goes on running until it is quit.
+func (m *model) upgrade() tea.Cmd {
+	if !update.Released() {
+		m.s.Note("note", "This tongs is "+update.Version()+", built from source and not a release; build it again to update it.")
+		return nil
+	}
+	return func() tea.Msg {
+		defer m.progress.Store(0)
+		tag, err := update.Newer(true)
+		if err == nil && tag == "" {
+			m.s.Note("note", "tongs "+update.Version()+" is the newest release.")
+			return newerMsg("")
+		}
+		if err == nil {
+			err = update.Apply(tag, m.downloading)
+		}
+		if err != nil {
+			m.s.Note("error", "updating tongs: "+err.Error())
+			return nil
+		}
+		m.s.Note("note", "tongs "+tag+" is in place. Quit and start tongs again to use it.")
+		return newerMsg("")
 	}
 }
 
@@ -816,6 +857,8 @@ func (m *model) do(action string) tea.Cmd {
 			}
 			return itemsMsg{"versions", 0, items}
 		}
+	case "update":
+		return m.upgrade()
 	case "quit":
 		m.quitting = true
 		return tea.Quit

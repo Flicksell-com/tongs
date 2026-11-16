@@ -5,18 +5,15 @@ package lldb
 
 import (
 	"archive/zip"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
+
+	"github.com/Flicksell-com/tongs/fetch"
 )
 
 // Pinned is the version tongs is tested with and uses unless another is chosen.
@@ -30,10 +27,7 @@ var sums = map[string]string{
 	"linux-x64":    "1cd7f386598022b51a5b93b9ffa23e812b23f519cfe1833384ec4bef4bfd1be1",
 }
 
-const (
-	releases = "https://github.com/vadimcn/codelldb/releases/download"
-	api      = "https://api.github.com/repos/vadimcn/codelldb/releases"
-)
+const repo = "vadimcn/codelldb"
 
 // platform is the host as CodeLLDB names it in its archives.
 func platform() (string, error) {
@@ -102,65 +96,21 @@ func Versions() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var found []release
-	if err := getJSON(api+"?per_page=40", &found); err != nil {
+	found, err := fetch.Recent(repo)
+	if err != nil {
 		return nil, err
 	}
 	var versions []string
 	for _, r := range found {
-		if _, ok := r.asset(plat); ok {
+		if _, ok := r.Sum(archiveName(plat)); ok {
 			versions = append(versions, strings.TrimPrefix(r.Tag, "v"))
 		}
 	}
 	return versions, nil
 }
 
-type release struct {
-	Tag    string `json:"tag_name"`
-	Assets []struct {
-		Name   string `json:"name"`
-		Digest string `json:"digest"` // "sha256:…", on releases GitHub has one for
-	} `json:"assets"`
-}
-
-// asset is the SHA-256 GitHub gives for a platform's archive ("" if none),
-// and whether the release has that archive at all.
-func (r release) asset(plat string) (sum string, ok bool) {
-	for _, a := range r.Assets {
-		if a.Name == "codelldb-"+plat+".vsix" {
-			return strings.TrimPrefix(a.Digest, "sha256:"), true
-		}
-	}
-	return "", false
-}
-
-var client = &http.Client{Timeout: 30 * time.Minute}
-
-func get(url string) (*http.Response, error) {
-	request, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("User-Agent", "tongs")
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	if response.StatusCode != http.StatusOK {
-		response.Body.Close()
-		return nil, fmt.Errorf("%s: %s", url, response.Status)
-	}
-	return response, nil
-}
-
-func getJSON(url string, into any) error {
-	response, err := get(url)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	return json.NewDecoder(response.Body).Decode(into)
-}
+// archiveName is what a platform's archive is called in a release.
+func archiveName(plat string) string { return "codelldb-" + plat + ".vsix" }
 
 // download fetches a version's archive, checks it, and unpacks it into dir -
 // whole or not at all, so a directory that is there is one that works.
@@ -172,11 +122,11 @@ func download(version, plat, dir string, say func(string)) error {
 	if version == Pinned {
 		want = sums[plat]
 	} else {
-		var r release
-		if err := getJSON(api+"/tags/v"+version, &r); err != nil {
+		r, err := fetch.Tagged(repo, "v"+version)
+		if err != nil {
 			return err
 		}
-		sum, ok := r.asset(plat)
+		sum, ok := r.Sum(archiveName(plat))
 		if !ok {
 			return fmt.Errorf("that release has no archive for %s", plat)
 		}
@@ -193,18 +143,11 @@ func download(version, plat, dir string, say func(string)) error {
 	defer os.Remove(archive.Name())
 	defer archive.Close()
 
-	response, err := get(fmt.Sprintf("%s/v%s/codelldb-%s.vsix", releases, version, plat))
+	got, size, err := fetch.File(repo, "v"+version, archiveName(plat),
+		fmt.Sprintf("the debugger: CodeLLDB %s for %s", version, plat), archive, say)
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
-	say(fmt.Sprintf("downloading the debugger: CodeLLDB %s for %s, %d MB", version, plat, response.ContentLength>>20))
-	hash := sha256.New()
-	size, err := io.Copy(io.MultiWriter(archive, hash), &progress{from: response.Body, total: response.ContentLength, say: say})
-	if err != nil {
-		return err
-	}
-	got := hex.EncodeToString(hash.Sum(nil))
 	switch {
 	case want == "":
 		say("this release publishes no checksum; the download was not verified")
@@ -229,26 +172,6 @@ func download(version, plat, dir string, say func(string)) error {
 	}
 	say("the debugger is ready")
 	return nil
-}
-
-// progress reports each tenth of a download as it is read.
-type progress struct {
-	from        io.Reader
-	total, read int64
-	told        int64
-	say         func(string)
-}
-
-func (p *progress) Read(buf []byte) (int, error) {
-	n, err := p.from.Read(buf)
-	p.read += int64(n)
-	if p.total > 0 {
-		if tenth := p.read * 10 / p.total; tenth > p.told && tenth < 10 {
-			p.told = tenth
-			p.say(fmt.Sprintf("  %d%%", tenth*10))
-		}
-	}
-	return n, err
 }
 
 // unpack writes the adapter and its lldb out of the archive into dir.

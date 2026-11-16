@@ -6,6 +6,8 @@
 //	tongs storefront
 //	tongs --dir ~/code/other-project
 //	tongs mcp
+//	tongs update
+//	tongs version
 //
 // With no argument it opens on the saved targets. The argument is a saved
 // target's name, a Bazel label, or a path to a binary. --dir debugs a project
@@ -13,7 +15,8 @@
 // also drive an open session through its socket (see the agent package).
 //
 // The debugger itself is downloaded the first time tongs runs (see the lldb
-// package); nothing has to be installed beforehand.
+// package); nothing has to be installed beforehand. `update` replaces tongs
+// with the newest release (see the update package).
 package main
 
 import (
@@ -25,6 +28,7 @@ import (
 	"github.com/Flicksell-com/tongs/session"
 	"github.com/Flicksell-com/tongs/store"
 	"github.com/Flicksell-com/tongs/ui"
+	"github.com/Flicksell-com/tongs/update"
 )
 
 func fail(err error) {
@@ -39,7 +43,17 @@ func main() {
 		dir, args = args[1], args[2:]
 	}
 	if len(args) > 1 || (len(args) == 1 && args[0] != "mcp" && args[0][0] == '-') {
-		fail(fmt.Errorf("usage: tongs [--dir <project>] [<saved name | //label | path | mcp>]"))
+		fail(fmt.Errorf("usage: tongs [--dir <project>] [<saved name | //label | path | mcp | update | version>]"))
+	}
+	if len(args) == 1 && args[0] == "version" {
+		fmt.Println("tongs", update.Version())
+		return
+	}
+	if len(args) == 1 && args[0] == "update" {
+		if err := update.Run(func(line string) { fmt.Println(line) }); err != nil {
+			fail(err)
+		}
+		return
 	}
 	entries, err := store.Load()
 	if err != nil {
