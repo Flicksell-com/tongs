@@ -234,14 +234,18 @@ from a release is never offered an update: build it again instead.
 
 ### Releasing
 
-Pushing a tag releases that version:
+A commit on `main` whose message begins `deploy:` and a version releases that
+version:
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0
+git commit -m "deploy: v0.2.0"   # or "deploy:0.2.0 the menu bar"
+git push
 ```
 
-The `release` workflow builds tongs for each platform and attaches the four
-binaries to a GitHub release named after the tag.
+The `release` workflow builds tongs for each platform, tags the commit with
+the version, and attaches the four binaries to a GitHub release of that name.
+It looks only at the last commit of a push, and fails if the message has no
+version or the version has been released before.
 
 ## Notes
 

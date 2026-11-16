@@ -1,34 +1,59 @@
-# Pushing a tag like v1.2.3 releases that version: tongs is built for each
-# platform and attached to a GitHub release of the same name. That release is
-# what `tongs update` and the update button look for.
+# A commit on main whose message begins "deploy:" and a version releases that
+# version:
+#
+#   deploy: v1.2.3
+#   deploy:1.2.3 the menu bar
+#
+# tongs is built for each platform and attached to a GitHub release tagged
+# with the version. That release is what `tongs update` and the update button
+# look for. Only the last commit of a push is looked at.
 name: release
 
 on:
   push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   release:
+    if: startsWith(github.event.head_commit.message, 'deploy:')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+      - name: Version
+        id: version
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          tag=$(printf '%s\n' "$MESSAGE" | head -n 1 |
+            sed -nE 's/^deploy:[[:space:]]*v?([0-9]+\.[0-9]+\.[0-9]+)([[:space:]].*)?$/v\1/p')
+          if [ -z "$tag" ]; then
+            echo "::error::A deploy: message needs a version after it, like 'deploy: v1.2.3'."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::$tag has been released already."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - run: go vet ./...
       - name: Build
         env:
           CGO_ENABLED: "0"
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
           for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
             GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath \
-              -ldflags "-s -w -X github.com/Flicksell-com/tongs/update.version=$GITHUB_REF_NAME" \
+              -ldflags "-s -w -X github.com/Flicksell-com/tongs/update.version=$TAG" \
               -o "dist/tongs-${target%/*}-${target#*/}" .
           done
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TAG" --generate-notes
