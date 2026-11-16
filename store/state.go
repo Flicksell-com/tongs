@@ -24,13 +24,15 @@ type State struct {
 	Side    string   `json:"side"`    // the tab of the side pane in front
 }
 
-// Layout is the sizes the panes were dragged to, 0 for the usual. They are
-// the same whatever is being debugged.
+// Layout is how the screen is set out, whatever is being debugged: the sizes
+// the panes were dragged to, 0 for the usual, and the colours chosen, "" for
+// the ones that suit the terminal.
 type Layout struct {
-	Side  int `json:"side"`
-	Logs  int `json:"logs"`
-	Stack int `json:"stack"`
-	Split int `json:"split"`
+	Side  int    `json:"side"`
+	Logs  int    `json:"logs"`
+	Stack int    `json:"stack"`
+	Split int    `json:"split"`
+	Theme string `json:"theme"`
 }
 
 // LoadState is how the target was left; nothing, the first time.

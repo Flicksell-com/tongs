@@ -53,8 +53,8 @@ Make and Bazel projects the form fills in a likely build command.
 
 A target is come back to as it was left: its breakpoints, the files open and
 the one in front, the watches, the variables opened out, and the commands
-typed. The sizes the panes were dragged to are kept too, for every target
-alike.
+typed. The sizes the panes were dragged to and the colours chosen are kept
+too, for every target alike.
 
 ### Keys
 
@@ -86,6 +86,9 @@ stack frame or a thread to select it, click a variable to open or close it,
 click a tab, scroll any pane. What a click would act on is picked out as the
 pointer passes over it. Drag the edge between two panes to resize them;
 "Panes: back to their usual sizes" in the menu undoes it.
+
+"Colours: choose a theme" in the menu changes the colours. Until one is
+chosen they are dark or light as the terminal is.
 
 ### Values
 

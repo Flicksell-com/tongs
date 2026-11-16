@@ -72,11 +72,14 @@ func (p *palette) current() (item, bool) {
 	return item{}, false
 }
 
-// view fills the whole window: at any size there is room to read the list.
+// view is a box over the middle of the screen, the same size whatever is
+// typed, so that it does not jump about as the list narrows.
 func (p *palette) view(width, height int) string {
-	inner := width - 4
+	boxW := min(width, max(width-8, 40), 96)
+	boxH := max(min(height-2, 26), 6)
+	inner := boxW - 4
 	lines := []string{styTitle.Render(p.title), p.input.View(), ""}
-	room := max(height-2-len(lines)-2, 1)
+	room := max(boxH-2-len(lines)-2, 1)
 	first := max(0, min(p.at-room/2, len(p.shown)-room))
 	// The details line up in a column, where the labels are short enough.
 	column := 0
@@ -112,9 +115,9 @@ func (p *palette) view(width, height int) string {
 	if len(p.shown) == 0 {
 		lines = append(lines, styDim.Render("  nothing matches"))
 	}
-	for len(lines) < height-4 {
+	for len(lines) < boxH-3 {
 		lines = append(lines, "")
 	}
 	lines = append(lines, styDim.Render(truncate(p.hint, inner)))
-	return zone.Scan(pane("", joinLines(lines), width, height, true))
+	return pane("", joinLines(lines), boxW, boxH, true)
 }

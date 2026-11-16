@@ -115,7 +115,8 @@ func highlight(path, text string, plain []string) []string {
 
 func (v *viewer) text() []rune { return v.plain[v.line-1] }
 
-// gutter is how many cells stand before the code: the marks, the line number.
+// gutter is how many cells stand before the code: the mark, the line number,
+// the bar at the code's edge.
 func (v *viewer) gutter() int { return 3 + len(fmt.Sprint(len(v.plain))) }
 
 func (v *viewer) clamp() {
@@ -379,37 +380,41 @@ func (v *viewer) find(line, col int, back, here bool) (found, wrapped bool) {
 	return false, false
 }
 
-// render draws the rows. pc is the line the program is stopped on in this
-// file, or 0; marks are the breakpoints' marks by line, and notes what is
-// written after the code of a line: the values of the variables it mentions.
+// render draws the rows: for each line a margin with its breakpoint mark and
+// its number, then the code. pc is the line the program is stopped on in
+// this file, or 0; marks are the breakpoints' marks by line, and notes what
+// is written after the code of a line: the values of the variables it
+// mentions.
 func (v *viewer) render(pc int, marks, notes map[int]string, focused bool) []string {
 	rows := make([]string, 0, v.height)
 	digits := len(fmt.Sprint(len(v.plain)))
-	for line := v.top; line < v.top+v.height && line <= len(v.plain); line++ {
+	for line := v.top; line < v.top+v.height; line++ {
+		if line > len(v.plain) {
+			// The margin runs on to the foot of the pane.
+			rows = append(rows, paint(repeat(" ", digits+2), colMantle))
+			continue
+		}
 		mark := " "
 		if marks[line] != "" {
 			mark = marks[line]
 		}
-		arrow := " "
-		if line == pc {
-			arrow = styHit.Render("❱")
-		}
-		number := fmt.Sprintf("%*d ", digits, line)
-		numberStyle := styDim
-		note := styNote
+		// A bar at the code's edge, on a band across it, says where the
+		// program is; a quieter one where the cursor is.
+		number, edge, note := styDim, " ", styNote
 		var code string
 		switch {
 		case line == v.line && focused:
-			numberStyle = styAccent
+			number, edge = styText, styAccent.Background(colSurface).Render("▎")
 			code = v.cursorRow(line == pc)
 			note = note.Background(colSurface)
 			if line == pc {
-				note = styNote.Background(styPC.GetBackground())
+				number, edge = styHit, styHit.Background(colRaised).Render("▎")
+				note = styNote.Background(colRaised)
 			}
 		case line == pc:
-			numberStyle = styHit
+			number, edge = styHit, styHit.Background(colRaised).Render("▎")
 			code = styPC.Render(fit(v.cut(string(v.plain[line-1])), v.width))
-			note = note.Background(styPC.GetBackground())
+			note = note.Background(colRaised)
 		case v.has(line):
 			code = fit(v.cut(v.marked(line)), v.width)
 		default:
@@ -424,7 +429,7 @@ func (v *viewer) render(pc int, marks, notes map[int]string, focused bool) []str
 			text := "   " + truncate(notes[line], room)
 			code = ansi.Truncate(code, used, "") + note.Render(text+repeat(" ", v.width-used-ansi.StringWidth(text)))
 		}
-		rows = append(rows, mark+arrow+numberStyle.Render(number)+code)
+		rows = append(rows, paint(mark+number.Render(fmt.Sprintf("%*d ", digits, line)), colMantle)+edge+code)
 	}
 	return rows
 }

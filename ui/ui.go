@@ -12,12 +12,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
 	zone "github.com/lrstanley/bubblezone"
 
 	"github.com/Flicksell-com/tongs/agent"
@@ -67,6 +68,7 @@ var actions = []struct{ name, key, action string }{
 	{"Show the threads", "", "side_threads"},
 	{"Stack and variables: show or hide", "", "side"},
 	{"Panes: back to their usual sizes", "", "sizes"},
+	{"Colours: choose a theme", "", "themes"},
 	{"Debugger: download it again", "", "lldb_fresh"},
 	{"Debugger: choose a version", "", "lldb_versions"},
 	{"Quit", "ctrl+q", "quit"},
@@ -77,6 +79,14 @@ var tools = []struct{ icon, name, key, action string }{
 	{"↑", "out", "f8", "finish"}, {"⏸", "pause", "^c", "pause"}, {"↻", "build", "^r", "restart"},
 	{"☰", "menu", "f1", "menu"},
 }
+
+// What turns in the status line while the program is busy.
+var spinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+const (
+	frameEvery = 80 * time.Millisecond  // between two steps of what moves on screen
+	flashFor   = 900 * time.Millisecond // a changed value takes this long to settle
+)
 
 const sourceKeys = "esc: the source, with vim's keys (h j k l w b e 0 $ gg G ^d ^u / ? n N * # % gd gr gt K ^o, counts)   space: breakpoint   R: run to   =: watch   i or : back to the prompt"
 
@@ -90,6 +100,7 @@ var asks = map[string]struct{ mark, hint string }{
 
 type (
 	changedMsg    struct{}
+	frameMsg      struct{}
 	candidatesMsg struct {
 		text  string
 		fill  bool
@@ -159,28 +170,37 @@ type model struct {
 	// are open while it is non-empty.
 	choicesFor string
 
-	src         viewer
-	inSource    bool // the source pane has the keys
-	noSource    string
-	console     viewport.Model
-	program     viewport.Model
-	consoleRaw  []string
-	programRaw  []string
-	consoleN    int
-	programN    int
-	locals      []localRow
-	vals        map[string]*vals // what the variables were, by function
-	stackTop    int              // first stack row shown
-	stackAt     int              // the frame the stack was last scrolled to show
-	sideTab     string           // which of sideTabs is in front
-	sideTop     int              // its first row shown
-	tabs        []*tab
-	clock       int      // counts the files shown, to tell which tab is oldest
-	zones       []string // what could be clicked in the last frame drawn
-	hot         string   // the one of those the pointer is over
-	tip         *tip
-	tipSeq      int
-	placeKey    string       // the frame the source was last moved to show
+	src        viewer
+	inSource   bool // the source pane has the keys
+	noSource   string
+	console    viewport.Model
+	program    viewport.Model
+	consoleRaw []string
+	programRaw []string
+	consoleN   int
+	programN   int
+	locals     []localRow
+	vals       map[string]*vals // what the variables were, by function
+	stackTop   int              // first stack row shown
+	stackAt    int              // the frame the stack was last scrolled to show
+	sideTab    string           // which of sideTabs is in front
+	sideTop    int              // its first row shown
+	tabs       []*tab
+	clock      int      // counts the files shown, to tell which tab is oldest
+	zones      []string // what could be clicked in the last frame drawn
+	hot        string   // the one of those the pointer is over
+	tip        *tip
+	tipSeq     int
+	placeKey   string // the frame the source was last moved to show
+	edge       string // the edge between panes the pointer is on
+	theme      string // the colours in use, by name
+	chosen     string // the same where they were chosen, "" where left to suit the terminal
+	frame      int    // counts up while something on screen is moving
+	framing    bool   // a frameMsg is on its way
+	flashAt    time.Time
+	// How far a download of the debugger has got, in percent plus one; 0
+	// when none is going on.
+	progress    atomic.Int32
 	stateKey    string       // the target the screen's state belongs to
 	stateFor    *store.Entry // the same, for saving it back
 	expanded    map[string]bool
@@ -216,6 +236,13 @@ func Run(root, adapter string, entries []store.Entry, first *store.Entry) error 
 		console: viewport.New(0, 0), program: viewport.New(0, 0), vals: map[string]*vals{}, sideTab: "vars"}
 	sizes := store.LoadLayout()
 	m.sideSet, m.logSet, m.stackSet, m.splitSet = sizes.Side, sizes.Logs, sizes.Stack, sizes.Split
+	// The colours chosen; with none chosen, ones that suit the terminal.
+	if sizes.Theme == "" && !lipgloss.HasDarkBackground() {
+		m.setTheme("Catppuccin Latte")
+	} else {
+		m.setTheme(sizes.Theme)
+	}
+	m.chosen = sizes.Theme
 
 	// All motion, not only drags: what the pointer is over is picked out.
 	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion())
@@ -239,7 +266,7 @@ func Run(root, adapter string, entries []store.Entry, first *store.Entry) error 
 	}
 	_, err = program.Run()
 	m.remember()
-	store.SaveLayout(store.Layout{Side: m.sideSet, Logs: m.logSet, Stack: m.stackSet, Split: m.splitSet})
+	store.SaveLayout(store.Layout{Side: m.sideSet, Logs: m.logSet, Stack: m.stackSet, Split: m.splitSet, Theme: m.chosen})
 	s.Close()
 	return err
 }
@@ -255,8 +282,53 @@ func (m *model) Init() tea.Cmd {
 
 // ---- update ----
 
+// Update takes a message, and keeps the screen moving while something on it
+// is: a spinner, a value settling, a download.
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if _, ok := msg.(frameMsg); ok {
+		m.framing = false
+		m.frame++
+	}
+	_, cmd := m.update(msg)
+	if m.framing || !m.moving() {
+		return m, cmd
+	}
+	m.framing = true
+	return m, tea.Batch(cmd, tea.Tick(frameEvery, func(time.Time) tea.Msg { return frameMsg{} }))
+}
+
+// moving says whether anything on screen changes with time alone.
+func (m *model) moving() bool {
+	switch m.snap.State {
+	case session.Building, session.Starting, session.Running:
+		return true
+	}
+	return m.progress.Load() > 0 || time.Since(m.flashAt) < flashFor
+}
+
+// setTheme draws everything in the colours of a name; the first, for a name
+// not known.
+func (m *model) setTheme(name string) {
+	chosen := themes[0]
+	for _, t := range themes {
+		if t.name == name {
+			chosen = t
+		}
+	}
+	chosen.use()
+	m.theme = chosen.name
+	m.input.PlaceholderStyle, m.input.TextStyle = styDim, styText
+	if m.src.path != "" {
+		m.src.read(m.src.path) // Its colours are worked out when it is read.
+	}
+	// The log is kept coloured: colour it again from the start.
+	m.consoleN, m.consoleRaw = 0, nil
+}
+
+func (m *model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case frameMsg:
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
@@ -379,18 +451,20 @@ func (m *model) refresh() tea.Cmd {
 	return m.loadLocals()
 }
 
+// consoleLine is a line of the lldb log as it is shown: a command stands out
+// at the margin, what it printed is set in under it.
 func consoleLine(line session.Line) string {
 	switch line.Kind {
 	case "lldb":
-		return stySub.Render("(lldb) " + line.Text)
+		return styAccent.Bold(true).Render("❯ ") + styText.Bold(true).Render(line.Text)
 	case "agent":
-		return styAgent.Render("(agent) " + line.Text)
+		return styAgent.Bold(true).Render("❯ "+line.Text) + styDim.Render("   agent")
 	case "error":
-		return styError.Render(line.Text)
+		return styError.Render("▎ " + line.Text)
 	case "note":
-		return styDim.Render(line.Text)
+		return styNote.Render("· " + line.Text)
 	}
-	return styText.Render(line.Text)
+	return styText.Render("  " + line.Text)
 }
 
 func tail(lines []string, keep int) []string {
@@ -403,7 +477,7 @@ func tail(lines []string, keep int) []string {
 // fill puts lines in a log pane, wrapped, staying at the bottom if it was.
 func (m *model) fill(pane *viewport.Model, lines []string) {
 	follow := pane.AtBottom()
-	pane.SetContent(lipgloss.NewStyle().Width(max(pane.Width, 1)).Render(strings.Join(lines, "\n")))
+	pane.SetContent(styText.Width(max(pane.Width, 1)).Render(strings.Join(lines, "\n")))
 	if follow {
 		pane.GotoBottom()
 	}
@@ -543,7 +617,21 @@ func (m *model) debugger(version string, fresh bool) tea.Cmd {
 		}
 	}
 	return func() tea.Msg {
-		adapter, err := lldb.Use(version, fresh, func(line string) { m.s.Note("note", line) })
+		defer m.progress.Store(0)
+		adapter, err := lldb.Use(version, fresh, func(line string) {
+			// "  40%" moves the bar in the status line; the rest is said.
+			if percent, err := strconv.Atoi(strings.TrimSuffix(strings.TrimSpace(line), "%")); err == nil {
+				m.progress.Store(int32(percent) + 1)
+				if m.s.OnChange != nil {
+					m.s.OnChange() // The bar is drawn from here on.
+				}
+				return
+			}
+			if strings.HasPrefix(line, "downloading") {
+				m.progress.Store(1)
+			}
+			m.s.Note("note", line)
+		})
 		if err != nil {
 			m.s.Note("error", err.Error())
 			return nil
@@ -687,6 +775,16 @@ func (m *model) do(action string) tea.Cmd {
 	case "sizes":
 		m.sideSet, m.logSet, m.stackSet, m.splitSet = 0, 0, 0, 0
 		m.layout()
+	case "themes":
+		var items []item
+		for _, t := range themes {
+			detail := ""
+			if t.name == m.theme {
+				detail = "in use"
+			}
+			items = append(items, item{label: t.name, detail: detail, value: t.name})
+		}
+		m.pal = newPalette("themes", "Colours", "enter uses it   esc closes", items)
 	case "lldb_fresh":
 		return m.debugger(lldb.Version(), true)
 	case "lldb_versions":
@@ -1380,6 +1478,11 @@ func (m *model) take(kind string, value any) tea.Cmd {
 		}
 	case "versions":
 		return m.debugger(value.(string), false)
+	case "themes":
+		m.setTheme(value.(string))
+		m.chosen = m.theme
+		m.layout()
+		return m.refresh()
 	case "places":
 		place := value.(nav.Place)
 		m.openFile(place.Path, place.Line, place.Col-1)
@@ -1576,7 +1679,7 @@ func (m *model) mouse(msg tea.MouseMsg) tea.Cmd {
 		// On a line with a breakpoint: when it is to stop.
 		if z := zone.Get("source"); z.InBounds(msg) && m.src.path != "" {
 			_, y := z.Pos(msg)
-			if id, ok := m.s.BreakOn(m.src.path, m.src.top+y-1); ok && y >= 1 {
+			if id, ok := m.s.BreakOn(m.src.path, m.src.top+y); ok {
 				m.askBreak("cond", id)
 			}
 		}
@@ -1594,12 +1697,11 @@ func (m *model) mouse(msg tea.MouseMsg) tea.Cmd {
 	}
 	if z := zone.Get("source"); z.InBounds(msg) && m.src.path != "" {
 		x, y := z.Pos(msg)
-		// Inside the border: row 0 and column 0 are the pane's edge.
-		if line := m.src.top + y - 1; y >= 1 && line <= len(m.src.plain) {
+		if line := m.src.top + y; line <= len(m.src.plain) {
 			m.inSource = true
-			m.src.at(line, max(x-1-m.src.gutter(), 0)+m.src.left)
-			if x <= 2 {
-				return m.do("break_here")
+			m.src.at(line, max(x-m.src.gutter(), 0)+m.src.left)
+			if x < m.src.gutter()-1 {
+				return m.do("break_here") // In the margin.
 			}
 		}
 		return nil
@@ -1672,17 +1774,21 @@ func (m *model) clicked(msg tea.MouseMsg) (tea.Cmd, bool) {
 // source and the side column, "logs" between those and the logs, "stack"
 // between the stack and the locals, "split" between the two logs.
 func (m *model) edgeAt(x, y int) string {
-	const top = 2 // under the status bar and the toolbar
-	inMain := y >= top && y < top+m.mainH-1
-	sideX := m.width - m.sideW // the side column's first cell
+	const top = 1         // under the status line
+	logs := top + m.mainH // the row the logs' strips are on
+	sourceW := m.width
+	if m.sideW > 0 {
+		sourceW -= m.sideW + 1
+	}
+	inMain := y >= top && y < logs
 	switch {
-	case y == top+m.mainH-1 || y == top+m.mainH:
+	case y == logs:
 		return "logs"
-	case m.sideW > 0 && inMain && (x == sideX-1 || x == sideX):
+	case m.sideW > 0 && inMain && (x == sourceW-1 || x == sourceW):
 		return "side"
-	case inMain && m.stackH > 0 && (m.sideW > 0 && x > sideX || m.sideW == 0 && m.showSide) && (y == top+m.stackH-1 || y == top+m.stackH):
+	case inMain && m.stackH > 0 && y == top+m.stackH && (m.sideW > 0 && x > sourceW || m.sideW == 0 && m.showSide):
 		return "stack"
-	case m.width >= splitLogsAt && y > top+m.mainH && y < top+m.mainH+m.logH && (x == m.logW-1 || x == m.logW):
+	case m.width >= splitLogsAt && y > logs && y < logs+m.logH && (x == m.logW-1 || x == m.logW):
 		return "split"
 	}
 	return ""
@@ -1736,17 +1842,13 @@ func (m *model) layout() {
 	if m.width == 0 {
 		return
 	}
-	promptH := 3
-	if m.height < 18 {
-		promptH = 1
-	}
 	m.logH = min(max(m.height/4, 5), 12)
 	if m.width < splitLogsAt {
 		m.logH = min(max(m.height/3, 6), 14) // Two logs, one over the other.
 	}
 	if m.logSet > 0 {
 		// A dragged size holds as far as the window leaves room for it.
-		m.logH = max(min(m.logSet, m.height-2-promptH-4), 4)
+		m.logH = max(min(m.logSet, m.height-2-4), 3)
 	}
 	m.sideW = 0
 	if m.width >= sideAt {
@@ -1755,9 +1857,14 @@ func (m *model) layout() {
 			m.sideW = max(min(m.sideSet, m.width-30), 20)
 		}
 	}
-	mainH := max(m.height-2-promptH-m.logH-min(len(m.choices), choicesMax), 3)
-	sourceW := m.width - m.sideW
-	m.src.resize(sourceW-2-3-len(strconv.Itoa(max(len(m.src.plain), 1))), mainH-2)
+	// A row each for the status line and the prompt; a pane's first row is
+	// its strip, and its last column its scroll bar.
+	mainH := max(m.height-2-m.logH-min(len(m.choices), choicesMax), 3)
+	sourceW := m.width
+	if m.sideW > 0 {
+		sourceW -= m.sideW + 1 // The line between them.
+	}
+	m.src.resize(sourceW-m.src.gutter()-1, mainH-1)
 
 	logW := m.width
 	if m.width >= splitLogsAt {
@@ -1765,14 +1872,14 @@ func (m *model) layout() {
 		if m.splitSet > 0 {
 			logW = max(min(m.splitSet, m.width-20), 20)
 		}
-		m.console.Height, m.program.Height = m.logH-2, m.logH-2
+		m.console.Height, m.program.Height = m.logH-1, m.logH-1
 		m.program.Width = m.width - logW - 2
 	} else {
-		m.console.Height = m.logH - m.logH/2 - 2
-		m.program.Height = m.logH/2 - 2
-		m.program.Width = m.width - 2
+		m.console.Height = m.logH - m.logH/2 - 1
+		m.program.Height = m.logH/2 - 1
+		m.program.Width = m.width - 1
 	}
-	m.console.Width = logW - 2
+	m.console.Width = logW - 1
 	m.logW = logW
 	m.fill(&m.console, m.consoleRaw)
 	m.fill(&m.program, m.programRaw)
@@ -1783,11 +1890,10 @@ func (m *model) View() string {
 	if m.quitting || m.width == 0 {
 		return ""
 	}
-	if m.pal != nil {
-		return m.pal.view(m.width, m.height)
-	}
-	// The form and the targets are dialogs over the screen.
+	// The palette, the form and the targets are dialogs over the screen.
 	switch {
+	case m.pal != nil:
+		return zone.Scan(over(m.screen(), m.pal.view(m.width, m.height), m.width, m.height))
 	case m.form != nil:
 		return zone.Scan(over(m.screen(), m.form.view(min(m.width, max(m.width-8, 40), 100), m.height-2), m.width, m.height))
 	case m.chooser != nil:
@@ -1796,58 +1902,49 @@ func (m *model) View() string {
 	return zone.Scan(m.withTip(m.screen()))
 }
 
-// screen is the debugger itself: the bars, the panes, the prompt.
+// screen is the debugger itself: the status line, the panes, the prompt.
 func (m *model) screen() string {
-	promptH := 3
-	if m.height < 18 {
-		promptH = 1
-	}
 	m.zones = m.zones[:0]
 	choices := m.choicesView()
-	mainH := max(m.height-2-promptH-m.logH-len(choices), 3)
+	mainH := max(m.height-2-m.logH-len(choices), 3)
 	m.mainH = mainH
+	lit := func(edge string) bool { return m.drag == edge || m.drag == "" && m.edge == edge }
 
-	rows := []string{m.statusBar(), m.toolBar()}
+	rows := []string{m.statusBar()}
 	switch {
 	case m.sideW > 0:
 		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top,
-			m.sourcePane(m.width-m.sideW, mainH), m.sidePanes(m.sideW, mainH)))
+			m.sourcePane(m.width-m.sideW-1, mainH), divider(mainH, lit("side")), m.sidePanes(m.sideW, mainH)))
 	case m.showSide:
 		rows = append(rows, m.sidePanes(m.width, mainH))
 	default:
 		rows = append(rows, m.sourcePane(m.width, mainH))
 	}
-	consoleTitle, programTitle := "lldb", "program output"
 	if m.width >= splitLogsAt {
-		logW := m.logW
 		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top,
-			zone.Mark("console", pane(consoleTitle, m.console.View(), logW, m.logH, false)),
-			zone.Mark("program", pane(programTitle, m.program.View(), m.width-logW, m.logH, false))))
+			m.logPane("console", "lldb", &m.console, m.logW, m.logH, lit("logs")), divider(m.logH, lit("split")),
+			m.logPane("program", "program output", &m.program, m.width-m.logW-1, m.logH, lit("logs"))))
 	} else {
 		rows = append(rows,
-			zone.Mark("console", pane(consoleTitle, m.console.View(), m.width, m.logH-m.logH/2, false)),
-			zone.Mark("program", pane(programTitle, m.program.View(), m.width, m.logH/2, false)))
+			m.logPane("console", "lldb", &m.console, m.width, m.logH-m.logH/2, lit("logs")),
+			m.logPane("program", "program output", &m.program, m.width, m.logH/2, false))
 	}
 	rows = append(rows, choices...)
-	rows = append(rows, zone.Mark("prompt", m.promptView(promptH)))
+	rows = append(rows, zone.Mark("prompt", m.promptView()))
 	return joinLines(rows)
 }
 
+// logPane is one of the two logs.
+func (m *model) logPane(id, title string, log *viewport.Model, width, height int, lit bool) string {
+	strip, body := panel(heading(title, false), "", splitLines(log.View()), width, height, colMantle, false, lit,
+		scroll{log.TotalLineCount(), log.YOffset})
+	return zone.Mark(id, stack(strip, body))
+}
+
+// statusBar is the top line: at the left what has the keys, what is being
+// debugged and how it stands; at the right the buttons, with their names and
+// keys as far as there is room.
 func (m *model) statusBar() string {
-	name := "no target"
-	if m.snap.Entry != nil {
-		name = m.snap.Entry.Name
-	}
-	state := m.snap.State
-	colour := colSubtext
-	switch state {
-	case session.Stopped:
-		colour = colYellow
-	case session.Running:
-		colour = colGreen
-	case session.Failed:
-		colour = colRed
-	}
 	mode := styModeAlt.Render(" PROMPT ")
 	if m.inSource {
 		mode = styMode.Render(" SOURCE ")
@@ -1859,33 +1956,58 @@ func (m *model) statusBar() string {
 	default:
 		mode = styModeAlt.Render(" ASKING ")
 	}
-	left := mode + styBar.Render(" "+name+" ") +
-		styBar.Foreground(colour).Bold(true).Render(" "+state+" ")
+	name := "no target"
+	if m.snap.Entry != nil {
+		name = m.snap.Entry.Name
+	}
+	turning := spinner[m.frame%len(spinner)]
+	dot, colour := "●", colOverlay
+	switch m.snap.State {
+	case session.Stopped:
+		colour = colYellow
+	case session.Running:
+		dot, colour = turning, colGreen
+	case session.Building, session.Starting:
+		dot, colour = turning, colBlue
+	case session.Failed:
+		dot, colour = "✖", colRed
+	case session.Exited:
+		dot = "■"
+	}
+	left := mode + styText.Bold(true).Render("  "+name) +
+		lipgloss.NewStyle().Foreground(colour).Bold(true).Render("   "+dot+" "+m.snap.State)
 	if m.snap.Detail != "" {
-		left += styBar.Foreground(colSubtext).Render(m.snap.Detail + " ")
+		left += stySub.Render("  " + m.snap.Detail)
 	}
-	right := ""
+	if got := int(m.progress.Load()) - 1; got >= 0 {
+		done := min(got/10, 10)
+		left += styAccent.Render("   debugger "+repeat("▰", done)) + styDim.Render(repeat("▱", 10-done)) + stySub.Render(fmt.Sprintf(" %d%%", got))
+	}
 	if keys := m.count + m.prefix; keys != "" {
-		right = styBar.Foreground(colYellow).Render(keys + " ")
+		left += styHit.Render("   " + keys)
 	}
-	return styBar.Render(fit(left, m.width-lipgloss.Width(right))) + right
-}
-
-// toolBar is always a line of its own, with words. The keys are shown where
-// there is room for them.
-func (m *model) toolBar() string {
-	withKeys := m.width >= 86
-	var out strings.Builder
-	for _, tool := range tools {
-		label := tool.icon + " " + tool.name
-		button := styTool.Render(label)
-		if withKeys {
-			button = styTool.Render(label + " " + styToolKey.Render(tool.key))
+	// The fullest form of the buttons that leaves the left its room.
+	right := ""
+	for form := 2; form >= 0; form-- {
+		right = ""
+		for _, tool := range tools {
+			label := " " + tool.icon + " "
+			if form >= 1 {
+				label = " " + tool.icon + " " + tool.name + " "
+			}
+			if form == 2 {
+				label += styToolKey.Render(tool.key + " ")
+			}
+			right += " " + m.spot("tool:"+tool.action, styTool.Render(label))
 		}
-		out.WriteString(m.spot("tool:"+tool.action, button))
+		if lipgloss.Width(left)+lipgloss.Width(right)+2 <= m.width {
+			break
+		}
 	}
-	bar := ansi.Truncate(out.String(), m.width, "")
-	return bar + lipgloss.NewStyle().Background(colMantle).Render(repeat(" ", m.width-lipgloss.Width(bar)))
+	if lipgloss.Width(left)+lipgloss.Width(right) > m.width {
+		right = ""
+	}
+	return paint(fit(left, m.width-lipgloss.Width(right))+right, colCrust)
 }
 
 func (m *model) sourcePane(width, height int) string {
@@ -1904,8 +2026,9 @@ func (m *model) sourcePane(width, height int) string {
 		} else {
 			message = strings.ToUpper(message[:1]) + message[1:] + ". ctrl+p opens a file."
 		}
-		lines := []string{"", "  " + styDim.Render(message)}
-		return zone.Mark("source", pane("source", block(lines, width-2, height-2), width, height, m.inSource))
+		strip, body := panel(heading("source", m.inSource), "", []string{"", "   " + styDim.Render(message)},
+			width, height, colBase, m.inSource, false, scroll{})
+		return stack(strip, zone.Mark("source", body))
 	}
 	pc, marks := 0, map[int]string{}
 	if view := m.snap.View; view != nil && view.Frames[view.Index].Path == m.src.path {
@@ -1916,7 +2039,7 @@ func (m *model) sourcePane(width, height int) string {
 			marks[point.Line] = breakMark(point)
 		}
 	}
-	// Over the top edge: the files open, and where the cursor is in this one.
+	// In the strip: the files open, and where the cursor is in this one.
 	where := fmt.Sprintf(" %d:%d ", m.src.line, m.src.col+1)
 	switch {
 	case m.noSource != "":
@@ -1925,21 +2048,20 @@ func (m *model) sourcePane(width, height int) string {
 		where = " edited since the build ·" + where
 	}
 	where = stySub.Render(where)
-	lines := m.src.render(pc, marks, m.notes(pc), m.inSource)
-	return zone.Mark("source", framed(m.tabBar(width-6-lipgloss.Width(where)), where, block(lines, width-2, height-2), width, height, m.inSource))
+	strip, body := panel(m.tabBar(width-2-lipgloss.Width(where)), where, m.src.render(pc, marks, m.notes(pc), m.inSource),
+		width, height, colBase, m.inSource, false, scroll{len(m.src.plain), m.src.top - 1})
+	return stack(strip, zone.Mark("source", body))
 }
 
 // window is the part of a list that fits a pane, scrolled to top, which it
-// keeps within the list. The title says where in the list that is, when
-// there is more than fits.
-func window(title string, lines []string, top *int, height int) (string, []string) {
+// keeps within the list, and where in the list that is.
+func window(lines []string, top *int, height int) ([]string, scroll) {
 	height = max(height, 0)
 	*top = max(0, min(*top, len(lines)-height))
 	if len(lines) <= height {
-		return title, lines
+		return lines, scroll{}
 	}
-	end := *top + height
-	return fmt.Sprintf("%s %d-%d/%d", title, *top+1, end, len(lines)), lines[*top:end]
+	return lines[*top : *top+height], scroll{len(lines), *top}
 }
 
 func (m *model) choicesView() []string {
@@ -1950,31 +2072,31 @@ func (m *model) choicesView() []string {
 	var rows []string
 	for i := first; i < len(m.choices) && i < first+choicesMax; i++ {
 		c := m.choices[i]
-		row := "  " + c.Name + "  " + styDim.Render(c.Type)
+		row := "   " + c.Name + "  " + styDim.Render(c.Type)
 		if i == m.choiceAt {
-			row = stySelect.Render(fit("❯ "+c.Name+"  "+c.Type, m.width))
+			row = stySelect.Render(fit(" ❯ "+c.Name+"  "+c.Type, m.width))
 		}
-		rows = append(rows, zone.Mark(fmt.Sprintf("choice:%d", i), fit(row, m.width)))
+		rows = append(rows, zone.Mark(fmt.Sprintf("choice:%d", i), paint(fit(row, m.width), colCrust)))
 	}
 	return rows
 }
 
-func (m *model) promptView(height int) string {
-	mark := "(lldb) ❯ "
+// promptView is the bottom line, where commands are typed. It is lit while
+// it has the keys.
+func (m *model) promptView() string {
+	mark := "lldb ❯ "
 	if m.asking != "" {
 		mark = asks[m.asking].mark
 		if m.asking == "find" && m.src.back {
 			mark = "? "
 		}
 	}
+	bg := colSurface
 	if m.inSource {
 		m.input.Blur()
+		bg = colMantle
 	} else {
 		m.input.Focus()
 	}
-	line := styAccent.Bold(true).Render(mark) + m.input.View()
-	if height == 1 {
-		return fit(line, m.width)
-	}
-	return pane("", fit(line, m.width-2), m.width, 3, !m.inSource)
+	return paint(fit(" "+styAccent.Bold(true).Render(mark)+m.input.View(), m.width), bg)
 }

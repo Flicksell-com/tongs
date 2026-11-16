@@ -117,17 +117,18 @@ func (m *model) tabNames() []string {
 	return names
 }
 
-// tabBar is the tabs as written over the source pane's top edge, in room
-// cells: the one in front and as many of its neighbours as fit.
+// tabBar is the tabs as written in the source pane's strip, in room cells:
+// the one in front and as many of its neighbours as fit. The one in front is
+// the pane's own shade, as if part of it.
 func (m *model) tabBar(room int) string {
 	names, at := m.tabNames(), m.tabOf(m.src.path)
 	if at < 0 {
 		return ""
 	}
 	// A tab is its name with a space each side; the one in front has a
-	// cross to close it by as well. A bar stands between two.
+	// cross to close it by as well.
 	width := func(i int) int {
-		w := len([]rune(names[i])) + 3
+		w := len([]rune(names[i])) + 2
 		if i == at {
 			w += 2
 		}
@@ -149,20 +150,21 @@ func (m *model) tabBar(room int) string {
 	}
 	bar := ""
 	if first > 0 {
-		bar += styDim.Render(" ‹")
+		bar += styDim.Render("‹ ")
 	}
 	for i := first; i <= last; i++ {
-		if i > first {
-			bar += styDim.Render("│")
-		}
 		if i == at {
-			bar += styAccent.Bold(true).Render(" "+names[i]+" ") + m.spot(fmt.Sprintf("tabx:%d", i), styDim.Render("× "))
+			name := styText.Bold(true)
+			if m.inSource {
+				name = styAccent.Bold(true)
+			}
+			bar += paint(name.Render(" "+names[i]+" ")+m.spot(fmt.Sprintf("tabx:%d", i), styDim.Render("× ")), colBase)
 		} else {
 			bar += m.spot(fmt.Sprintf("tab:%d", i), stySub.Render(" "+names[i]+" "))
 		}
 	}
 	if last < len(names)-1 {
-		bar += styDim.Render("› ")
+		bar += styDim.Render(" ›")
 	}
 	return bar
 }

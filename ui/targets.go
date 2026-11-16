@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	zone "github.com/lrstanley/bubblezone"
 	"github.com/sahilm/fuzzy"
@@ -177,6 +178,7 @@ func over(screen, box string, width, height int) string {
 	}
 	left := max((width-boxW)/2, 0)
 	top := max((height-len(front))/3, 0)
+	dim := lipgloss.NewStyle().Foreground(colRaised)
 	out := make([]string, height)
 	for y := range out {
 		plain := ""
@@ -185,11 +187,11 @@ func over(screen, box string, width, height int) string {
 		}
 		plain = fit(plain, width)
 		if y < top || y >= top+len(front) {
-			out[y] = styDim.Render(plain)
+			out[y] = paint(dim.Render(plain), colCrust)
 			continue
 		}
-		out[y] = styDim.Render(ansi.Truncate(plain, left, "")) + front[y-top] +
-			styDim.Render(ansi.Cut(plain, left+boxW, width))
+		out[y] = paint(dim.Render(ansi.Truncate(plain, left, "")), colCrust) + front[y-top] +
+			paint(dim.Render(ansi.Cut(plain, left+boxW, width)), colCrust)
 	}
 	return joinLines(out)
 }
