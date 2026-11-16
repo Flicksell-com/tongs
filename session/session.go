@@ -20,6 +20,7 @@ import (
 // The states a session is in.
 const (
 	NoTarget = "no target"
+	Ready    = "ready" // a target is open; nothing of it is running
 	Building = "building"
 	Starting = "starting"
 	Running  = "running"
@@ -76,9 +77,14 @@ type Place struct {
 	Line int
 }
 
-// Break is a breakpoint: where it is and how it is set.
+// Break is a breakpoint: where it is and how it is set. Its place is the line
+// it was asked for on. Lands is the line the program stops on for it, where
+// that is another: the next with code, for one asked for on a line with none.
 type Break struct {
 	Place
+	Lands     int
+	Function  string // for one set on a function by its name
+	Unplaced  bool   // the running program has no code it could be put on
 	Enabled   bool
 	Condition string // stops only when this holds; "" for always
 	Log       string // printed instead of stopping; "" for one that stops
@@ -125,25 +131,29 @@ type Session struct {
 	// One start at a time; a second waits for the first to settle.
 	starting sync.Mutex
 
-	mu      sync.Mutex
-	client  *dap.Client
-	gen     int // which client's events still count
-	state   string
-	detail  string
-	entry   *store.Entry
-	live    *store.Entry // the target the running client was started for
-	root    string
-	binary  string
-	view    *View
-	shown   *where
-	breaks  map[int]Place
-	details map[int]detail // how each breakpoint is set, as lldb last said
-	logs    map[int]string // what the ones that print instead of stopping print
-	watches []string
-	seq     int
-	console []Line
-	program []string
-	files   []string
+	mu     sync.Mutex
+	client *dap.Client
+	gen    int // which client's events still count
+	state  string
+	detail string
+	entry  *store.Entry
+	live   *store.Entry // the target the running client was started for
+	root   string
+	binary string
+	view   *View
+	shown  *where
+	breaks map[int]Place
+	// The target's breakpoints (see points.go). breaks is where the
+	// debugger put each of its own, by its number for it; bound says a
+	// debugger has been given them, and changes are to go through it.
+	points    []*point
+	nextPoint int
+	bound     bool
+	watches   []string
+	seq       int
+	console   []Line
+	program   []string
+	files     []string
 	// Counts the program being set running, to tell a command that ran it
 	// from one that only printed.
 	resumes     int
@@ -203,14 +213,7 @@ func (s *Session) Snapshot() Snapshot {
 			snap.Newer[path] = true
 		}
 	}
-	for id, place := range s.breaks {
-		place.Line = s.tracked[place.Path].now(place.Line)
-		point := Break{Place: place, Enabled: true, Log: s.logs[id]}
-		if d, ok := s.details[id]; ok {
-			point.Enabled, point.Condition, point.Hits = d.on, d.condition, d.hits
-		}
-		snap.Breaks[id] = point
-	}
+	snap.Breaks = s.describe()
 	if s.view != nil && s.state == Stopped {
 		view := *s.view
 		view.Frames = append([]Frame(nil), view.Frames...)
@@ -259,20 +262,54 @@ func (s *Session) setState(state, detail string) {
 	s.changed()
 }
 
-// Start builds the target and starts it under the debugger, in the
-// background. A first start stops at entry, for breakpoints to be set; a
-// restart runs on.
-func (s *Session) Start(entry store.Entry, restart bool) {
+// Load opens a target without running it: its breakpoints can be seen and
+// changed, and Restart builds and starts it. Whatever was running is ended.
+func (s *Session) Load(entry store.Entry) {
 	s.mu.Lock()
+	s.entry = &entry
+	s.root = entry.Project(s.Home)
+	s.state, s.detail = Ready, ""
+	s.view, s.shown, s.files, s.bound = nil, nil, nil, false
+	s.mu.Unlock()
+	s.loadPoints(entry)
+	s.changed()
+	go func() {
+		// Behind a start that is under way, which must come to rest first.
+		s.starting.Lock()
+		defer s.starting.Unlock()
+		s.mu.Lock()
+		old := s.client
+		s.client, s.live = nil, nil
+		s.gen++
+		if s.entry != nil && s.entry.PointsFile(s.Home) == entry.PointsFile(s.Home) && s.state != Building {
+			s.state, s.detail = Ready, ""
+		}
+		s.mu.Unlock()
+		if old != nil {
+			old.Close()
+		}
+		s.changed()
+	}()
+}
+
+// Start builds the target and starts it under the debugger, in the
+// background. With runOn it runs until something stops it; without, it stops
+// before its first instruction.
+func (s *Session) Start(entry store.Entry, runOn bool) {
+	s.mu.Lock()
+	other := s.entry == nil || s.entry.PointsFile(s.Home) != entry.PointsFile(s.Home)
 	s.entry = &entry
 	s.root = entry.Project(s.Home)
 	s.state, s.detail = Building, "" // Now, so anyone waiting sees it begin.
 	s.mu.Unlock()
+	if other {
+		s.loadPoints(entry)
+	}
 	s.changed()
-	go s.start(entry, restart)
+	go s.start(entry, runOn)
 }
 
-// Restart rebuilds and starts the current target again, breakpoints kept.
+// Restart builds the open target and starts it, or starts it again.
 func (s *Session) Restart() {
 	s.mu.Lock()
 	entry := s.entry
@@ -285,7 +322,6 @@ func (s *Session) Restart() {
 func (s *Session) start(entry store.Entry, restart bool) {
 	s.starting.Lock()
 	defer s.starting.Unlock()
-	s.keepBreakpoints()
 
 	// Let go of the old client before ending it, so that its last words (the
 	// program was killed, the adapter exited) are not taken for news.
@@ -295,7 +331,10 @@ func (s *Session) start(entry store.Entry, restart bool) {
 	s.gen++
 	gen := s.gen
 	s.view, s.shown, s.files = nil, nil, nil
-	s.breaks, s.details, s.logs = map[int]Place{}, nil, map[int]string{}
+	s.breaks, s.bound = map[int]Place{}, false
+	for _, p := range s.points {
+		p.lldb, p.lands, p.hits, p.unplaced = 0, 0, 0, false
+	}
 	s.stoppedOnce, s.runOn = false, restart
 	s.echo, s.held = "", nil
 	s.initialized, s.entryStop = make(chan struct{}), make(chan struct{})
@@ -312,7 +351,7 @@ func (s *Session) start(entry store.Entry, restart bool) {
 		s.setState(Failed, err.Error())
 		return
 	}
-	s.rebase(entry, binary, entry.BreakpointsFile(s.Home))
+	s.rebase(entry, binary)
 	s.setState(Starting, "")
 
 	// At the root, so the workspace-relative paths in Bazel's debug info resolve.
@@ -375,10 +414,17 @@ func (s *Session) start(entry store.Entry, restart bool) {
 
 	// Under the lock: the entry stop has the view asking lldb where it is.
 	s.talk.Lock()
-	kept := entry.BreakpointsFile(s.Home)
-	if _, err := os.Stat(kept); err == nil {
-		s.repl(fmt.Sprintf(`breakpoint read -f "%s"`, kept))
-		s.keptLogs(kept)
+	s.apply()
+	// Breakpoints kept the old way, in a file lldb wrote: read once, taken
+	// in as the target's own, and the file done with.
+	if old := entry.BreakpointsFile(s.Home); len(s.Snapshot().Breaks) == 0 {
+		if _, err := os.Stat(old); err == nil {
+			s.repl(fmt.Sprintf(`breakpoint read -f "%s"`, old))
+			s.mirror()
+		}
+		os.Remove(old)
+	} else {
+		os.Remove(old)
 	}
 	if restart {
 		s.repl("process continue")
@@ -387,9 +433,9 @@ func (s *Session) start(entry store.Entry, restart bool) {
 	if !restart {
 		had := ""
 		if n := len(s.Snapshot().Breaks); n > 0 {
-			had = fmt.Sprintf("%d breakpoints from last time; ", n)
+			had = fmt.Sprintf("%d breakpoints set; ", n)
 		}
-		s.Note("note", "stopped at entry: "+had+"set breakpoints, then c")
+		s.Note("note", "stopped at entry: "+had+"c runs it")
 	}
 }
 
@@ -455,6 +501,7 @@ func (s *Session) event(gen int, name string, body map[string]any) {
 		s.state, s.detail = Exited, fmt.Sprintf("status %d", num(body["exitCode"]))
 		s.view, s.shown = nil, nil
 	case "adapter-exited":
+		s.bound = false // Nothing left to tell of a change.
 		closeOnce(s.entryStop)
 		if s.state == Starting || s.state == Running || s.state == Stopped {
 			s.state, s.detail = Failed, "the debugger exited"
@@ -492,7 +539,7 @@ func (s *Session) current() *dap.Client {
 func (s *Session) repl(command string) string {
 	client := s.current()
 	if client == nil {
-		return "error: nothing is being debugged"
+		return "error: the program isn't running. Run starts it (ctrl+r)."
 	}
 	s.mu.Lock()
 	s.awaiting = true
@@ -566,7 +613,7 @@ func (s *Session) sync() {
 	if moved && at != nil {
 		s.look(at)
 	}
-	s.breakDetails()
+	s.mirror()
 }
 
 // look reads the stopped program where lldb has it selected: the stack, the
@@ -727,26 +774,8 @@ func (s *Session) Pause() {
 	}
 }
 
-// keepBreakpoints writes the live client's breakpoints where its target will
-// find them next time: after a restart, or another day.
-func (s *Session) keepBreakpoints() {
-	s.mu.Lock()
-	client, live, ready := s.client, s.live, s.stoppedOnce
-	s.mu.Unlock()
-	if client == nil || live == nil || !ready || !client.Alive() {
-		return // No session, or one that never got as far as having breakpoints.
-	}
-	kept := live.BreakpointsFile(s.Home)
-	os.MkdirAll(filepath.Dir(kept), 0o755)
-	os.Remove(kept) // With none set, lldb writes nothing, and none is right.
-	s.talk.Lock()
-	s.repl(fmt.Sprintf(`breakpoint write -f "%s"`, kept))
-	s.talk.Unlock()
-}
-
-// Close ends the session, remembering its breakpoints.
+// Close ends the session and the program with it.
 func (s *Session) Close() {
-	s.keepBreakpoints()
 	closeOnce(s.done)
 	s.mu.Lock()
 	client := s.client
@@ -755,19 +784,6 @@ func (s *Session) Close() {
 	s.mu.Unlock()
 	if client != nil {
 		client.Close()
-	}
-}
-
-// ToggleBreak sets a breakpoint on a line, or removes the one there.
-func (s *Session) ToggleBreak(path string, line int) {
-	for id, place := range s.Snapshot().Breaks {
-		if place.Path == path && place.Line == line {
-			s.Execute(fmt.Sprintf("breakpoint delete %d", id), "lldb")
-			return
-		}
-	}
-	if line, ok := s.built(path, line); ok {
-		s.Execute(fmt.Sprintf(`breakpoint set --file "%s" --line %d`, path, line), "lldb")
 	}
 }
 
@@ -793,16 +809,4 @@ func (s *Session) RunTo(path string, line int) {
 	s.repl(fmt.Sprintf(`breakpoint set --one-shot true --file "%s" --line %d`, path, line))
 	s.talk.Unlock()
 	s.Execute("continue", "lldb")
-}
-
-// BreakAt sets a breakpoint on a function and says where it landed.
-func (s *Session) BreakAt(function string) (Place, bool) {
-	before := s.Snapshot().Breaks
-	s.Execute(fmt.Sprintf(`breakpoint set --name "%s"`, function), "lldb")
-	for id, place := range s.Snapshot().Breaks {
-		if _, had := before[id]; !had {
-			return place.Place, true
-		}
-	}
-	return Place{}, false
 }

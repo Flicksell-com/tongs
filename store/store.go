@@ -56,7 +56,11 @@ func (e Entry) kept(home, what string) string {
 	return filepath.Join(cache, ".cache", "tongs", what, hex.EncodeToString(sum[:8])+".json")
 }
 
-// BreakpointsFile is where this target's breakpoints are kept between runs.
+// PointsFile is where this target's breakpoints are kept.
+func (e Entry) PointsFile(home string) string { return e.kept(home, "points") }
+
+// BreakpointsFile is where they were kept before, as lldb wrote them out;
+// one found there is read once and then removed.
 func (e Entry) BreakpointsFile(home string) string { return e.kept(home, "breakpoints") }
 
 func expand(path string) string {

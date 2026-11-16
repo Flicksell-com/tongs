@@ -367,6 +367,18 @@ func (m *model) breakIDs() []int {
 	return ids
 }
 
+// breakName is a breakpoint as it is listed: its file and line, or the
+// function it is on where the place of that is not yet known.
+func (m *model) breakName(point session.Break, short bool) string {
+	switch {
+	case point.Path == "":
+		return point.Function + "()"
+	case short:
+		return fmt.Sprintf("%s:%d", filepath.Base(point.Path), point.Line)
+	}
+	return fmt.Sprintf("%s:%d", agent.Rel(m.snap.Root, point.Path), point.Line)
+}
+
 // breakMark is a breakpoint's mark, in the margin and in the list: round for
 // one that stops, a diamond for one with a condition, an arrow for one that
 // prints and runs on, hollow for one turned off.
@@ -374,6 +386,8 @@ func breakMark(point session.Break) string {
 	switch {
 	case !point.Enabled:
 		return styDim.Render("○")
+	case point.Unplaced:
+		return styDim.Render("◌") // The program has no code to put it on.
 	case point.Log != "":
 		return lipgloss.NewStyle().Foreground(colMauve).Render("◆")
 	case point.Condition != "":
@@ -390,15 +404,19 @@ func (m *model) breakRows(width int) []string {
 	var rows []string
 	for _, id := range ids {
 		point := m.snap.Breaks[id]
-		text := fmt.Sprintf("%s:%d", agent.Rel(m.snap.Root, point.Path), point.Line)
-		if width < 60 {
-			text = fmt.Sprintf("%s:%d", filepath.Base(point.Path), point.Line)
+		text := m.breakName(point, width < 60)
+		if point.Unplaced {
+			text += styDim.Render("  no code here")
 		}
 		if !point.Enabled {
 			text = styDim.Render(text)
 		}
 		if point.Hits > 0 {
 			text += styDim.Render(fmt.Sprintf("  ×%d", point.Hits))
+		}
+		if point.Lands != 0 {
+			// Asked for where there is no code: where it stops instead.
+			text += styDim.Render(fmt.Sprintf("  stops on %d", point.Lands))
 		}
 		if point.Condition != "" {
 			text += styDim.Render("  if ") + lipgloss.NewStyle().Foreground(colYellow).Render(point.Condition)
@@ -523,12 +541,5 @@ func (m *model) withTip(screen string) string {
 	if y >= m.height {
 		y = m.tip.y - 1
 	}
-	x := max(min(m.tip.x, m.width-lipgloss.Width(text)), 0)
-	lines := splitLines(screen)
-	if y < 0 || y >= len(lines) {
-		return screen
-	}
-	const reset = "\x1b[0m"
-	lines[y] = ansi.Truncate(lines[y], x, "") + reset + text + reset + ansi.Cut(lines[y], x+lipgloss.Width(text), m.width)
-	return joinLines(lines)
+	return overlay(screen, text, max(min(m.tip.x, m.width-lipgloss.Width(text)), 0), y, m.width)
 }

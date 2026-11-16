@@ -29,19 +29,6 @@ func fit(s string, width int) string {
 	return s + repeat(" ", width-ansi.StringWidth(s))
 }
 
-// block makes lines exactly height rows of width cells.
-func block(lines []string, width, height int) string {
-	out := make([]string, height)
-	for i := range out {
-		if i < len(lines) {
-			out[i] = fit(lines[i], width)
-		} else {
-			out[i] = repeat(" ", width)
-		}
-	}
-	return joinLines(out)
-}
-
 // shellSplit splits a line the way a shell would: on spaces, with quotes
 // keeping a word together. ok is false for an unclosed quote.
 func shellSplit(s string) (words []string, ok bool) {

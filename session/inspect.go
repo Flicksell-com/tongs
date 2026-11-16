@@ -1,12 +1,7 @@
 package session
 
 import (
-	"encoding/json"
-	"fmt"
-	"os"
-	"reflect"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -25,8 +20,6 @@ var (
 	declRe = regexp.MustCompile(`^[^:]+:(\d+): \(.*?\) (\w+) = `)
 	// What lldb says is wrong with an expression, without where in it.
 	errorRe = regexp.MustCompile(`error: (?:<[^>]*>:\d+:\d+: )?(.+)`)
-	// The message inside the script logScript writes.
-	loggedRe = regexp.MustCompile(`bytes\(\[([\d,]*)\]\)\.decode\(\)\)\); return False$`)
 )
 
 // ---- watches ----
@@ -167,51 +160,6 @@ func (s *Session) declared() map[string]int {
 
 // ---- breakpoints ----
 
-// detail is how a breakpoint is set, beyond where.
-type detail struct {
-	on        bool
-	condition string
-	hits      int
-}
-
-// Asks lldb's own scripting for what `breakpoint list` only prints as prose.
-const breakScript = `script import json; print(json.dumps([[b.GetID(), b.IsEnabled(), b.GetHitCount(), b.GetCondition() or ""] for b in lldb.target.breakpoint_iter()]))`
-
-// breakDetails reads how every breakpoint is set, and returns their ids in
-// order. Callers hold talk.
-func (s *Session) breakDetails() []int {
-	var rows [][]any
-	if json.Unmarshal([]byte(s.repl(breakScript)), &rows) != nil {
-		return nil
-	}
-	details := map[int]detail{}
-	var ids []int
-	for _, row := range rows {
-		if len(row) != 4 {
-			continue
-		}
-		d := detail{hits: num(row[2])}
-		d.on, _ = row[1].(bool)
-		d.condition, _ = row[3].(string)
-		details[num(row[0])] = d
-		ids = append(ids, num(row[0]))
-	}
-	sort.Ints(ids)
-	s.mu.Lock()
-	same := reflect.DeepEqual(details, s.details)
-	s.details = details
-	for id := range s.logs {
-		if _, has := details[id]; !has {
-			delete(s.logs, id)
-		}
-	}
-	s.mu.Unlock()
-	if !same {
-		s.changed()
-	}
-	return ids
-}
-
 // quote writes text as one argument of an lldb command.
 func quote(text string) string {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(text) + `"`
@@ -231,31 +179,11 @@ func (s *Session) quiet(command string) bool {
 	return true
 }
 
-// SetEnabled turns a breakpoint on or off, leaving it where it is.
-func (s *Session) SetEnabled(id int, on bool) {
-	verb := map[bool]string{true: "enable", false: "disable"}[on]
-	s.quiet(fmt.Sprintf("breakpoint %s %d", verb, id))
-}
-
-// SetCondition has a breakpoint stop only when an expression holds; "" has it
-// stop every time.
-func (s *Session) SetCondition(id int, condition string) {
-	condition = strings.TrimSpace(condition)
-	if !s.quiet(fmt.Sprintf("breakpoint modify --condition %s %d", quote(condition), id)) {
-		return
-	}
-	if condition == "" {
-		s.Note("note", fmt.Sprintf("Breakpoint %d stops every time.", id))
-	} else {
-		s.Note("note", fmt.Sprintf("Breakpoint %d stops when %s.", id, condition))
-	}
-}
-
 // logScript is the breakpoint callback, in lldb's Python, that prints a
 // message and has the program run on. An expression in {braces} is replaced
 // by its value. The message goes in as its bytes, so that nothing in it needs
 // quoting on the way through lldb's command line, and comes back out of a
-// saved breakpoint the same way (see keptLogs).
+// saved breakpoint the same way.
 func logScript(message string) string {
 	codes := make([]string, len(message))
 	for i := 0; i < len(message); i++ {
@@ -266,77 +194,12 @@ func logScript(message string) string {
 		"bytes([" + strings.Join(codes, ",") + "]).decode())); return False"
 }
 
-// SetLog has a breakpoint print a message and run on rather than stop; ""
-// has it stop again.
-func (s *Session) SetLog(id int, message string) {
-	message = strings.TrimSpace(message)
-	if message == "" {
-		s.mu.Lock()
-		_, had := s.logs[id]
-		delete(s.logs, id)
-		s.mu.Unlock()
-		if had && s.quiet(fmt.Sprintf("breakpoint command delete %d", id)) {
-			s.Note("note", fmt.Sprintf("Breakpoint %d stops again.", id))
-		}
+// Stop ends the program, leaving the debugger with its breakpoints.
+func (s *Session) Stop() {
+	if state := s.Snapshot().State; state != Running && state != Stopped {
 		return
 	}
-	if !s.quiet(fmt.Sprintf(`breakpoint command add --script-type python %d --one-liner "%s"`, id, logScript(message))) {
-		return
+	if s.quiet("process kill") {
+		s.Note("note", "The program was stopped. ctrl+r builds and starts it again.")
 	}
-	s.mu.Lock()
-	s.logs[id] = message
-	s.mu.Unlock()
-	s.Note("note", fmt.Sprintf("Breakpoint %d prints instead of stopping: %s", id, message))
-	s.changed()
-}
-
-// keptLogs finds, among the breakpoints just read back from a file lldb
-// wrote, the ones that print instead of stopping, and remembers what they
-// print. lldb reads them back in the order it wrote them. Callers hold talk.
-func (s *Session) keptLogs(path string) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	var points []struct {
-		Breakpoint struct {
-			BKPTOptions struct {
-				BKPTCMDData struct {
-					UserSource []string
-				}
-			}
-		}
-	}
-	ids := s.breakDetails()
-	if json.Unmarshal(raw, &points) != nil || len(points) != len(ids) {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i, point := range points {
-		for _, line := range point.Breakpoint.BKPTOptions.BKPTCMDData.UserSource {
-			found := loggedRe.FindStringSubmatch(line)
-			if found == nil {
-				continue
-			}
-			var message []byte
-			for _, code := range strings.Split(found[1], ",") {
-				if b, err := strconv.Atoi(code); err == nil {
-					message = append(message, byte(b))
-				}
-			}
-			s.logs[ids[i]] = string(message)
-		}
-	}
-}
-
-// BreakOn is the breakpoint on a line of a file as it is on disk, if any.
-func (s *Session) BreakOn(path string, line int) (int, bool) {
-	found, has := 0, false
-	for id, point := range s.Snapshot().Breaks {
-		if point.Path == path && point.Line == line && (!has || id < found) {
-			found, has = id, true
-		}
-	}
-	return found, has
 }

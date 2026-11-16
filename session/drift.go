@@ -1,7 +1,6 @@
 package session
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,7 +114,7 @@ func (s *Session) poll() {
 	}
 	s.mu.Unlock()
 
-	changed := false
+	changed, moved := false, false
 	for path, before := range was {
 		info, err := os.Stat(path)
 		if err != nil || (info.ModTime().Equal(before.mod) && info.Size() == before.size) {
@@ -130,6 +129,16 @@ func (s *Session) poll() {
 		if t == nil {
 			s.mu.Unlock()
 			continue
+		}
+		// The breakpoints in it go with their lines.
+		went := Match(t.lines, lines)
+		for _, p := range s.points {
+			if p.Path == path {
+				p.Line, moved = Follow(went, len(lines), p.Line), true
+				if p.lands != 0 {
+					p.lands = Follow(went, len(lines), p.lands)
+				}
+			}
 		}
 		t.lines, t.mod, t.size = lines, info.ModTime(), info.Size()
 		t.edits++
@@ -156,16 +165,18 @@ func (s *Session) poll() {
 		s.mu.Unlock()
 		changed = true
 	}
+	if moved {
+		s.savePoints()
+	}
 	if changed {
 		s.changed()
 	}
 }
 
 // rebase is called when a program has been built and is about to start: the
-// files it was built from are the ones on disk now, so the breakpoints kept
-// from the last program are moved to where their lines went, and the lines on
-// disk become the ones to measure from.
-func (s *Session) rebase(entry store.Entry, binary, kept string) {
+// files it was built from are the ones on disk now, so the lines on disk
+// become the ones to measure from.
+func (s *Session) rebase(entry store.Entry, binary string) {
 	// A target with a build step was just built from what is on disk. A bare
 	// binary is as old as its file says, and may predate an edit.
 	built := time.Now()
@@ -173,70 +184,14 @@ func (s *Session) rebase(entry store.Entry, binary, kept string) {
 	if info, err := os.Stat(binary); err == nil && !fresh {
 		built = info.ModTime()
 	}
-	type move struct {
-		to    []int
-		count int
-	}
 	s.mu.Lock()
 	s.builtAt = built
-	root := s.root
-	moves := map[string]move{}
-	for path, t := range s.tracked {
-		if t.mod.After(built) {
-			continue // Still newer than the program.
+	for _, t := range s.tracked {
+		if !t.mod.After(built) { // One still newer than the program stays so.
+			t.built, t.to, t.from, t.newer = t.lines, nil, nil, false
 		}
-		if t.to != nil {
-			moves[path] = move{t.to, len(t.lines)}
-		}
-		t.built, t.to, t.from, t.newer = t.lines, nil, nil, false
 	}
 	s.mu.Unlock()
-	if len(moves) == 0 {
-		return
-	}
-	moveKept(kept, func(name string, line int) int {
-		for path, m := range moves {
-			if path == name || path == filepath.Join(root, name) || strings.HasSuffix(path, "/"+name) {
-				return Follow(m.to, m.count, line)
-			}
-		}
-		return line
-	})
-}
-
-// moveKept rewrites the lines of the file-and-line breakpoints in a file
-// written by lldb's `breakpoint write`. Anything it doesn't recognise it
-// leaves as it is.
-func moveKept(path string, move func(file string, line int) int) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	var points []map[string]any
-	if json.Unmarshal(raw, &points) != nil {
-		return
-	}
-	moved := false
-	for _, point := range points {
-		breakpoint, _ := point["Breakpoint"].(map[string]any)
-		resolver, _ := breakpoint["BKPTResolver"].(map[string]any)
-		options, _ := resolver["Options"].(map[string]any)
-		file, _ := options["FileName"].(string)
-		line, isLine := options["LineNumber"].(float64)
-		if resolver["Type"] != "FileAndLine" || file == "" || !isLine {
-			continue
-		}
-		if to := move(file, int(line)); to != int(line) {
-			options["LineNumber"] = to
-			moved = true
-		}
-	}
-	if !moved {
-		return
-	}
-	if out, err := json.Marshal(points); err == nil {
-		os.WriteFile(path, out, 0o644)
-	}
 }
 
 // Match pairs the lines of two versions of a file: for each line of old, the

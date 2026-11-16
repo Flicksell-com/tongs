@@ -30,8 +30,8 @@ Needs Go 1.25 or later. Runs on macOS and Linux, arm64 and x86-64.
 
 ```sh
 tongs                       # open on the saved targets
-tongs build/app             # debug a binary
-tongs //package:binary      # build a Bazel target with -c dbg and debug it
+tongs build/app             # open a binary
+tongs //package:binary      # open a Bazel target, built with -c dbg when run
 tongs storefront            # a saved target, by name
 tongs --dir ~/code/other    # a project somewhere else
 ```
@@ -39,6 +39,10 @@ tongs --dir ~/code/other    # a project somewhere else
 Run it from inside the project. The project is the folder of a saved target
 you are inside, else the nearest directory above you that is a Bazel workspace
 or a git repository.
+
+Opening a target builds nothing and runs nothing. Its files can be read and
+its breakpoints set; Run (`ctrl+r`) then builds it and starts it under the
+debugger, and it runs until a breakpoint stops it.
 
 A target is a binary plus, optionally, the shell command that builds it, its
 arguments and its environment. Every project's targets are kept together, in
@@ -65,12 +69,13 @@ Enter on an empty prompt repeats the last command. Tab completes.
 | --- | --- |
 | `f5` `f6` `f7` `f8` | continue, step over, step in, step out |
 | `ctrl+c` | pause the program |
-| `ctrl+r` | rebuild and restart, breakpoints kept |
+| `ctrl+r` | run: build and start, or start again, breakpoints kept |
 | `ctrl+t` | choose what to debug |
 | `ctrl+p` | open one of the program's source files |
 | `ctrl+n` | find a function and break there |
 | `ctrl+b` | list breakpoints, to go to one or change it |
-| `f1` | the menu, with everything above and more |
+| `f1` | search everything that can be done |
+| `f10` | the menu bar; arrows move, enter chooses |
 | `esc` | move into the source |
 | `ctrl+q` | quit |
 
@@ -85,9 +90,14 @@ The mouse works too: click a line, click the margin for a breakpoint, click a
 stack frame or a thread to select it, click a variable to open or close it,
 click a tab, scroll any pane. What a click would act on is picked out as the
 pointer passes over it. Drag the edge between two panes to resize them;
-"Panes: back to their usual sizes" in the menu undoes it.
+"Panes: back to their usual sizes" in the View menu undoes it.
 
-"Colours: choose a theme" in the menu changes the colours. Until one is
+Along the top is a menu bar, and under it the buttons. Run builds the program
+and starts it, and becomes Restart while it is alive; Stop ends it. Continue,
+the steps and Pause are lit only while they would do something: the first
+four while the program is stopped, Pause while it runs.
+
+"Colours: choose a theme" in the View menu changes the colours. Until one is
 chosen they are dark or light as the terminal is.
 
 ### Values
@@ -102,14 +112,22 @@ program stopped in that function is picked out in yellow.
 
 A watch is an expression worked out again at every stop, at the top of the
 variables pane. `=` in the source watches what is under the cursor; "+ watch"
-on the pane's edge, or "Watch an expression" in the menu, asks for one. The ×
+on the pane's edge, or "Watch an expression" in the Watch menu, asks for one. The ×
 beside a watch drops it.
 
 ### Breakpoints
 
 `space` on a line, or a click in its margin, sets a breakpoint or removes the
-one there. The breakpoints tab lists them with how often each was hit. There,
-or with the keys shown in `ctrl+b`'s list:
+one there. Any line will do: on one with no code (a blank line, a brace, the
+line a function's name is on) the breakpoint stays marked where it was put,
+and stops the program on the next line that has code. They can be set and
+removed at any time: before the program has run, while it is stopped or
+running, and after it has ended. They are the target's own, kept as they are
+changed, and given to the debugger each time the program starts. One set or
+deleted at the prompt (`b`, `breakpoint delete`) is taken in the same.
+
+The breakpoints tab lists them with how often each was hit. There, or with
+the keys shown in `ctrl+b`'s list:
 
 - click the mark to turn one off without losing it, and on again;
 - **if** gives it a condition, an expression it stops only when true (`C` in
@@ -186,7 +204,7 @@ its own lldb. The first run downloads the release tongs is tested with, checks
 it against a checksum compiled into tongs, and unpacks it into
 `~/.cache/tongs/codelldb`.
 
-From the menu (`f1`):
+From the Debugger menu:
 
 - **Debugger: download it again** fetches the version in use afresh.
 - **Debugger: choose a version** lists CodeLLDB's releases and switches to

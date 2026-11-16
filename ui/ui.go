@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	promptHint  = "lldb command   (enter repeats the last, tab completes, esc to the source, f1 menu)"
+	promptHint  = "lldb command   (enter repeats the last, tab completes, esc to the source, f1 search, f10 menus)"
 	sideAt      = 100 // columns from which stack and locals fit beside the source
 	splitLogsAt = 90  // columns from which the two logs fit side by side
 	partsShown  = 100 // parts of one variable listed when it is opened
@@ -42,10 +42,11 @@ const (
 var actions = []struct{ name, key, action string }{
 	{"Continue", "f5", "continue"},
 	{"Step over", "f6", "next"},
-	{"Step in", "f7", "step"},
+	{"Step into", "f7", "step"},
 	{"Step out", "f8", "finish"},
 	{"Pause", "ctrl+c", "pause"},
-	{"Rebuild and restart", "ctrl+r", "restart"},
+	{"Run: build and start, or start again", "ctrl+r", "restart"},
+	{"Stop the program", "", "stop"},
 	{"Choose what to debug", "ctrl+t", "targets"},
 	{"Open a file", "ctrl+p", "files"},
 	{"Find a function and break there", "ctrl+n", "functions"},
@@ -72,12 +73,6 @@ var actions = []struct{ name, key, action string }{
 	{"Debugger: download it again", "", "lldb_fresh"},
 	{"Debugger: choose a version", "", "lldb_versions"},
 	{"Quit", "ctrl+q", "quit"},
-}
-
-var tools = []struct{ icon, name, key, action string }{
-	{"▶", "go", "f5", "continue"}, {"↷", "next", "f6", "next"}, {"↓", "in", "f7", "step"},
-	{"↑", "out", "f8", "finish"}, {"⏸", "pause", "^c", "pause"}, {"↻", "build", "^r", "restart"},
-	{"☰", "menu", "f1", "menu"},
 }
 
 // What turns in the status line while the program is busy.
@@ -193,6 +188,12 @@ type model struct {
 	tipSeq     int
 	placeKey   string // the frame the source was last moved to show
 	edge       string // the edge between panes the pointer is on
+	// The menu bar: whether one of its menus is open, which, the row of it
+	// the cursor is on (-1 for none), and where each menu's name begins.
+	menuOn     bool
+	menu       int
+	menuAt     int
+	menuStarts []int
 	theme      string // the colours in use, by name
 	chosen     string // the same where they were chosen, "" where left to suit the terminal
 	frame      int    // counts up while something on screen is moving
@@ -265,6 +266,7 @@ func Run(root, adapter string, entries []store.Entry, first *store.Entry) error 
 		s.Note("note", "agents: echo help | nc -U "+agent.SocketPath())
 	}
 	_, err = program.Run()
+	fmt.Print("\x1b]22;default\x1b\\") // The mouse pointer as it was.
 	m.remember()
 	store.SaveLayout(store.Layout{Side: m.sideSet, Logs: m.logSet, Stack: m.stackSet, Split: m.splitSet, Theme: m.chosen})
 	s.Close()
@@ -273,7 +275,7 @@ func Run(root, adapter string, entries []store.Entry, first *store.Entry) error 
 
 func (m *model) Init() tea.Cmd {
 	if m.first != nil {
-		m.s.Start(*m.first, false)
+		m.s.Load(*m.first) // Opened, not run: Run does that.
 		return textinput.Blink
 	}
 	m.openTargets()
@@ -652,15 +654,22 @@ func (m *model) do(action string) tea.Cmd {
 	case "pause":
 		go m.s.Pause()
 	case "restart":
-		if m.needTarget() {
+		if m.snap.Entry == nil {
+			m.openTargets() // Nothing to run yet: choose it.
+		} else {
 			m.s.Restart()
 		}
+	case "stop":
+		go m.s.Stop()
+	case "menubar":
+		m.menuOn, m.menu, m.menuAt = !m.menuOn, 0, -1
+		m.menuStep(1)
 	case "menu":
 		var items []item
 		for _, a := range actions {
 			items = append(items, item{label: a.name, detail: a.key, value: a.action})
 		}
-		m.pal = newPalette("menu", "Menu", sourceKeys, items)
+		m.pal = newPalette("menu", "Search for something to do", sourceKeys, items)
 	case "targets":
 		m.openTargets()
 	case "files":
@@ -691,7 +700,7 @@ func (m *model) do(action string) tea.Cmd {
 			if point.Log != "" {
 				detail += "  prints " + point.Log
 			}
-			items = append(items, item{label: fmt.Sprintf("%s:%d", agent.Rel(m.snap.Root, point.Path), point.Line), detail: detail, value: id})
+			items = append(items, item{label: m.breakName(point, false), detail: detail, value: id})
 		}
 		m.pal = newPalette("breakpoints", "Breakpoints",
 			"enter goes there   ctrl+e turns it on or off   ctrl+o condition   ctrl+l print and run on   ctrl+d deletes   esc closes", items)
@@ -974,7 +983,12 @@ func (m *model) key(msg tea.KeyMsg) tea.Cmd {
 	if m.pal != nil {
 		return m.paletteKey(msg)
 	}
+	if m.menuOn {
+		return m.menuKey(key)
+	}
 	switch key {
+	case "f10":
+		return m.do("menubar")
 	case "ctrl+c":
 		return m.do("pause")
 	case "f5":
@@ -1413,7 +1427,8 @@ func (m *model) paletteKey(msg tea.KeyMsg) tea.Cmd {
 	case "ctrl+d":
 		if ok && p.kind == "breakpoints" {
 			m.pal = nil
-			return m.run(fmt.Sprintf("breakpoint delete %d", current.value.(int)))
+			id := current.value.(int)
+			return func() tea.Msg { m.s.RemoveBreak(id); return nil }
 		}
 		return nil
 	case "ctrl+e", "ctrl+o", "ctrl+l":
@@ -1492,7 +1507,7 @@ func (m *model) take(kind string, value any) tea.Cmd {
 		// session says it is the one loaded (see refresh).
 		m.remember()
 		m.stateFor, m.stateKey = nil, ""
-		m.s.Start(m.targets.get()[value.(int)], false)
+		m.s.Load(m.targets.get()[value.(int)])
 	}
 	return nil
 }
@@ -1634,6 +1649,9 @@ func (m *model) mouse(msg tea.MouseMsg) tea.Cmd {
 		}
 		return nil
 	}
+	if m.pal == nil && m.menuOn {
+		return m.menuMouse(msg)
+	}
 	if m.pal == nil && m.drag == "" && press {
 		// Before the edges: the tabs written over them are for clicking.
 		if cmd, did := m.clicked(msg); did {
@@ -1727,6 +1745,8 @@ func (m *model) clicked(msg tea.MouseMsg) (tea.Cmd, bool) {
 	switch kind {
 	case "tool":
 		return m.do(rest), true
+	case "menu":
+		m.menuOn, m.menu, m.menuAt = true, n, -1
 	case "tab":
 		m.front(n)
 	case "tabx":
@@ -1763,7 +1783,7 @@ func (m *model) clicked(msg tea.MouseMsg) (tea.Cmd, bool) {
 	case "blog":
 		m.askBreak("log", n)
 	case "bdel":
-		return m.run(fmt.Sprintf("breakpoint delete %d", n)), true
+		return func() tea.Msg { m.s.RemoveBreak(n); return nil }, true
 	default:
 		return nil, false
 	}
@@ -1774,7 +1794,7 @@ func (m *model) clicked(msg tea.MouseMsg) (tea.Cmd, bool) {
 // source and the side column, "logs" between those and the logs, "stack"
 // between the stack and the locals, "split" between the two logs.
 func (m *model) edgeAt(x, y int) string {
-	const top = 1         // under the status line
+	top := m.headH()      // under the menu bar and the buttons
 	logs := top + m.mainH // the row the logs' strips are on
 	sourceW := m.width
 	if m.sideW > 0 {
@@ -1848,7 +1868,7 @@ func (m *model) layout() {
 	}
 	if m.logSet > 0 {
 		// A dragged size holds as far as the window leaves room for it.
-		m.logH = max(min(m.logSet, m.height-2-4), 3)
+		m.logH = max(min(m.logSet, m.height-m.headH()-1-4), 3)
 	}
 	m.sideW = 0
 	if m.width >= sideAt {
@@ -1857,9 +1877,9 @@ func (m *model) layout() {
 			m.sideW = max(min(m.sideSet, m.width-30), 20)
 		}
 	}
-	// A row each for the status line and the prompt; a pane's first row is
-	// its strip, and its last column its scroll bar.
-	mainH := max(m.height-2-m.logH-min(len(m.choices), choicesMax), 3)
+	// Under the head and over the prompt's row; a pane's first row is its
+	// strip, and its last column its scroll bar.
+	mainH := max(m.height-m.headH()-1-m.logH-min(len(m.choices), choicesMax), 3)
 	sourceW := m.width
 	if m.sideW > 0 {
 		sourceW -= m.sideW + 1 // The line between them.
@@ -1899,18 +1919,26 @@ func (m *model) View() string {
 	case m.chooser != nil:
 		return zone.Scan(over(m.screen(), m.chooser.view(m.width, m.height), m.width, m.height))
 	}
-	return zone.Scan(m.withTip(m.screen()))
+	screen := m.withTip(m.screen())
+	if box, x := m.dropdown(m.menuStarts); box != "" {
+		screen = overlay(screen, box, x, m.menuH(), m.width)
+	}
+	// The pointer's shape goes on after the click zones are found: they are
+	// found by counting cells, and its code would be counted as some.
+	return m.pointer() + zone.Scan(screen)
 }
 
 // screen is the debugger itself: the status line, the panes, the prompt.
 func (m *model) screen() string {
 	m.zones = m.zones[:0]
 	choices := m.choicesView()
-	mainH := max(m.height-2-m.logH-len(choices), 3)
+	mainH := max(m.height-m.headH()-1-m.logH-len(choices), 3)
 	m.mainH = mainH
 	lit := func(edge string) bool { return m.drag == edge || m.drag == "" && m.edge == edge }
 
-	rows := []string{m.statusBar()}
+	bar, starts := m.menuBar()
+	m.menuStarts = starts
+	rows := append(bar, m.toolBar(m.headH()-m.menuH())...)
 	switch {
 	case m.sideW > 0:
 		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top,
@@ -1941,81 +1969,13 @@ func (m *model) logPane(id, title string, log *viewport.Model, width, height int
 	return zone.Mark(id, stack(strip, body))
 }
 
-// statusBar is the top line: at the left what has the keys, what is being
-// debugged and how it stands; at the right the buttons, with their names and
-// keys as far as there is room.
-func (m *model) statusBar() string {
-	mode := styModeAlt.Render(" PROMPT ")
-	if m.inSource {
-		mode = styMode.Render(" SOURCE ")
-	}
-	switch m.asking {
-	case "":
-	case "find":
-		mode = styModeAlt.Render(" SEARCH ")
-	default:
-		mode = styModeAlt.Render(" ASKING ")
-	}
-	name := "no target"
-	if m.snap.Entry != nil {
-		name = m.snap.Entry.Name
-	}
-	turning := spinner[m.frame%len(spinner)]
-	dot, colour := "●", colOverlay
-	switch m.snap.State {
-	case session.Stopped:
-		colour = colYellow
-	case session.Running:
-		dot, colour = turning, colGreen
-	case session.Building, session.Starting:
-		dot, colour = turning, colBlue
-	case session.Failed:
-		dot, colour = "✖", colRed
-	case session.Exited:
-		dot = "■"
-	}
-	left := mode + styText.Bold(true).Render("  "+name) +
-		lipgloss.NewStyle().Foreground(colour).Bold(true).Render("   "+dot+" "+m.snap.State)
-	if m.snap.Detail != "" {
-		left += stySub.Render("  " + m.snap.Detail)
-	}
-	if got := int(m.progress.Load()) - 1; got >= 0 {
-		done := min(got/10, 10)
-		left += styAccent.Render("   debugger "+repeat("▰", done)) + styDim.Render(repeat("▱", 10-done)) + stySub.Render(fmt.Sprintf(" %d%%", got))
-	}
-	if keys := m.count + m.prefix; keys != "" {
-		left += styHit.Render("   " + keys)
-	}
-	// The fullest form of the buttons that leaves the left its room.
-	right := ""
-	for form := 2; form >= 0; form-- {
-		right = ""
-		for _, tool := range tools {
-			label := " " + tool.icon + " "
-			if form >= 1 {
-				label = " " + tool.icon + " " + tool.name + " "
-			}
-			if form == 2 {
-				label += styToolKey.Render(tool.key + " ")
-			}
-			right += " " + m.spot("tool:"+tool.action, styTool.Render(label))
-		}
-		if lipgloss.Width(left)+lipgloss.Width(right)+2 <= m.width {
-			break
-		}
-	}
-	if lipgloss.Width(left)+lipgloss.Width(right) > m.width {
-		right = ""
-	}
-	return paint(fit(left, m.width-lipgloss.Width(right))+right, colCrust)
-}
-
 func (m *model) sourcePane(width, height int) string {
 	if m.src.path == "" {
 		message := m.noSource
 		if message == "" {
 			message = map[string]string{
 				session.NoTarget: "ctrl+t picks a target to debug.",
+				session.Ready:    "ctrl+p opens a file, to set breakpoints in. Run (ctrl+r) builds and starts the program.",
 				session.Building: "Building…",
 				session.Starting: "Starting…",
 				session.Stopped:  "ctrl+p opens a file. A breakpoint, then f5, and the program stops in one.",
